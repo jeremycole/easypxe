@@ -1,0 +1,470 @@
+#!/usr/bin/perl -w
+
+# Copyright (c) Jeremy Cole
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#
+# TODO:
+#   * Check all use of 'die' to be more daemon friendly.
+#   * Check for all hard-coded crap.
+#   * Catch various signals and do something intelligent.
+#   * Basic pool support, for "unassigned machine" pools.
+#   * Support for setting the machine hostname.
+#   * Check the interplay between Lease and Reservation/Pool to ensure that
+#     conflicts don't occur.
+
+#
+#   From RFC 2131 "4.3.6 Client messages":
+#   
+#   Table 4 details the differences between messages from clients in
+#   various states.
+#   
+#                   +-------------+------------+------------+------------+
+#                   | REBOOTING   | REQUESTING | RENEWING   | REBINDING  |
+#   +---------------+-------------+------------+------------+------------+
+#   | broad/unicast | broadcast   | broadcast  | unicast    | broadcast  |
+#   | server-ip     | MUST NOT    | MUST       | MUST NOT   | MUST NOT   |
+#   | requested-ip  | MUST        | MUST       | MUST NOT   | MUST NOT   |
+#   | ciaddr        | zero        | zero       | IP address | IP address |
+#   +---------------+-------------+----------- +------------+------------+
+#   
+#           Table 4: Client messages from different states
+#
+
+#
+#   From RFC 2131 "4.4 DHCP client behavior":
+#
+#    --------                               -------
+#   |        | +-------------------------->|       |<-------------------+
+#   | INIT-  | |     +-------------------->| INIT  |                    |
+#   | REBOOT |DHCPNAK/         +---------->|       |<---+               |
+#   |        |Restart|         |            -------     |               |
+#    --------  |  DHCPNAK/     |               |                        |
+#       |      Discard offer   |      -/Send DHCPDISCOVER               |
+#   -/Send DHCPREQUEST         |               |                        |
+#       |      |     |      DHCPACK            v        |               |
+#    -----------     |   (not accept.)/   -----------   |               |
+#   |           |    |  Send DHCPDECLINE |           |                  |
+#   | REBOOTING |    |         |         | SELECTING |<----+            |
+#   |           |    |        /          |           |     |DHCPOFFER/  |
+#    -----------     |       /            -----------   |  |Collect     |
+#       |            |      /                  |   |       |  replies   |
+#   DHCPACK/         |     /  +----------------+   +-------+            |
+#   Record lease, set|    |   v   Select offer/                         |
+#   timers T1, T2   ------------  send DHCPREQUEST      |               |
+#       |   +----->|            |             DHCPNAK, Lease expired/   |
+#       |   |      | REQUESTING |                  Halt network         |
+#       DHCPOFFER/ |            |                       |               |
+#       Discard     ------------                        |               |
+#       |   |        |        |                   -----------           |
+#       |   +--------+     DHCPACK/              |           |          |
+#       |              Record lease, set    -----| REBINDING |          |
+#       |                timers T1, T2     /     |           |          |
+#       |                     |        DHCPACK/   -----------           |
+#       |                     v     Record lease, set   ^               |
+#       +----------------> -------      /timers T1,T2   |               |
+#                  +----->|       |<---+                |               |
+#                  |      | BOUND |<---+                |               |
+#     DHCPOFFER, DHCPACK, |       |    |            T2 expires/   DHCPNAK/
+#      DHCPNAK/Discard     -------     |             Broadcast  Halt network
+#                  |       | |         |            DHCPREQUEST         |
+#                  +-------+ |        DHCPACK/          |               |
+#                       T1 expires/   Record lease, set |               |
+#                    Send DHCPREQUEST timers T1, T2     |               |
+#                    to leasing server |                |               |
+#                            |   ----------             |               |
+#                            |  |          |------------+               |
+#                            +->| RENEWING |                            |
+#                               |          |----------------------------+
+#                                ----------
+#             Figure 5:  State-transition diagram for DHCP clients
+#
+
+use strict;
+
+use AppConfig;
+
+use Data::Dumper;
+use POSIX qw(setsid strftime SIGINT SIGHUP SIGQUIT);
+
+use Event::Lib;
+use IO::Socket::INET;
+use Net::DHCP::Packet;
+use Net::DHCP::Constants;
+
+use EasyPXE::Plugin;
+
+my $PROGRAM = "easypxe";
+my $VERSION = "0.1";
+
+#
+# A global variable to store the configuration object.
+#
+my $config = undef;
+
+#
+# Structure to hold initialized plugins.
+#
+my $plugin = {};
+
+# The full set of configuration options in AppConfig format.
+my $config_options = {
+  "help|?"                        => { DEFAULT => 0 },
+  "version|V"                     => { DEFAULT => 0 },
+  "config|c=s"                    => { DEFAULT => "/etc/easypxe.conf" },
+                                  
+  "driver=s"                      => { DEFAULT => "mysql" },
+  "host=s"                        => { DEFAULT => "localhost" },
+  "user=s"                        => { DEFAULT => "" },
+  "password=s"                    => { DEFAULT => "" },
+  "port=s"                        => { DEFAULT => 3306 },
+  "socket=s"                      => { DEFAULT => "" },
+  "database=s"                    => { DEFAULT => "dhcp" },
+                                  
+  "server_identifier=s"           => { DEFAULT => undef },
+  "interface=s"                   => { DEFAULT => undef },
+
+  "server_port=s"                 => { DEFAULT => 67 },
+  "client_port=s"                 => { DEFAULT => 68 },
+
+  "default_lease_time=s"          => { DEFAULT => 14400 },
+  "minimum_lease_time=s"          => { DEFAULT => 300 },
+
+  "config_plugin=s@"              => { DEFAULT => [] },
+
+  "plugin_network=s"              => { DEFAULT => "EasyPXE::Network::UDP" },
+  "plugin_protocol=s"             => { DEFAULT => "EasyPXE::Protocol::Standard" },
+  "plugin_dbi=s"                  => { DEFAULT => "EasyPXE::DBI::MySQL" },
+  "plugin_session=s"              => { DEFAULT => "EasyPXE::Session::DBI" },
+  "plugin_lease=s"                => { DEFAULT => "EasyPXE::Lease::DBI" },
+  "plugin_reservation=s"          => { DEFAULT => "EasyPXE::Reservation::DBI" },
+  "plugin_pool=s"                 => { DEFAULT => "EasyPXE::Pool::DBI" },
+  "plugin_boot=s"                 => { DEFAULT => "EasyPXE::Boot::None" },
+  "plugin_balance=s"              => { DEFAULT => "EasyPXE::Balance::None" },
+};
+
+my $usage_information = {
+  "" => {
+    "help" => {
+      ALIASES   => [ "-?" ],
+      ARGUMENTS => [ ],
+      MESSAGE   => [ "Show this help." ],
+    },
+    "version" => {
+      ALIASES   => [ "-V" ],
+      ARGUMENTS => [ ],
+      MESSAGE   => [ "Display version information (version ${VERSION})." ],
+    },
+    "config" => {
+      ALIASES   => [ "-c" ],
+      ARGUMENTS => [ "<file>" ],
+      MESSAGE   => [ "Configuration file to use." ],
+    },
+  },
+  "dbi" => {
+    "driver" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<dbi driver>" ],
+      MESSAGE   => [ "Name of the DBI driver to use (mysql)." ],
+    },
+    "host" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<host>" ],
+      MESSAGE   => [ "The MySQL host to connect to." ],
+    },
+    "user" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<user>" ],
+      MESSAGE   => [ "The user to connect to MySQL as." ],
+    },
+    "password" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<password>" ],
+      MESSAGE   => [ "The password for the MySQL user." ],
+    },
+    "port" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<port>" ],
+      MESSAGE   => [ "The TCP port to connect to MySQL on." ],
+    },
+    "socket" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<socket>" ],
+      MESSAGE   => [ "The Unix socket file to connect to MySQL on, if connecting locally." ],
+    },
+    "database" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<db>" ],
+      MESSAGE   => [ "The database to use after connecting to MySQL." ],
+    },
+  },
+
+  "basic" => {
+    "server_identifier" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<ip>" ],
+      MESSAGE   => [
+        "Normally, the IP address of this server, which is used as a",
+        "unique identifier per DHCP server on a given network."
+      ],
+    },
+    "interface" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<name>" ],
+      MESSAGE   => [ "The network interface to listen on." ],
+    },
+
+    "server_port" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<port>" ],
+      MESSAGE   => [ "The UDP port to listen on (normally 67)." ],
+    },
+    "client_port" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<port>" ],
+      MESSAGE   => [ "The UDP port to send replies to (normally 68)." ],
+    },
+
+    "minimum_lease_time" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<seconds>" ],
+      MESSAGE   => [
+        "A minimum lease time to apply to an offer if no lease time is",
+        "specified by the plugin generating the offer."
+      ],
+    },
+  },
+  
+  "plugin" => {
+    "config_plugin" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<key>=<value>" ],
+      MESSAGE   => [ "Use this option to provide configuration information to plugins." ],
+    },
+    "plugin_network" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<package>" ],
+      MESSAGE   => [ "The network management plugin to use." ],
+    },
+    "plugin_protocol" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<package>" ],
+      MESSAGE   => [ "The protocol management plugin to use." ],
+    },
+    "plugin_session" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<package>" ],
+      MESSAGE   => [ "The session management plugin to use." ],
+    },
+    "plugin_lease" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<package>" ],
+      MESSAGE   => [ "The lease management plugin to use." ],
+    },
+    "plugin_reservation" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<package>" ],
+      MESSAGE   => [ "The reservation management plugin to use." ],
+    },
+    "plugin_pool" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<package>" ],
+      MESSAGE   => [ "The pool management plugin to use." ],
+    },
+    "plugin_boot" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<package>" ],
+      MESSAGE   => [ "The boot parameter plugin to use (for PXE boot)." ],
+    },
+    "plugin_balance" => {
+      ALIASES   => [ ],
+      ARGUMENTS => [ "<package>" ],
+      MESSAGE   => [ "The load balancing and high availability plugin to use." ],
+    },
+  },
+};
+
+#
+# Read the configuration information from the command line and configuration
+# file (usually /etc/easypxe.conf).  (TODO: This currently behaves somewhat
+# strangely in the sense that information in the config file would override
+# the same options passed on the command line.  This is the opposite of what
+# many programs do.)
+#
+sub read_config
+{
+  $config = new AppConfig({ CASE => 1, PEDANTIC => 1 }, %{$config_options});
+  
+  $config->getopt;
+  
+  if(my $config_file = $config->get("config"))
+  {
+    $config->file($config_file) if(-e $config_file);
+  }
+}
+
+sub version
+{
+  print <<END_OF_VERSION;
+$PROGRAM ($0) version $VERSION
+
+This software comes with ABSOLUTELY NO WARRANTY. This is free software,
+and you are welcome to modify and redistribute it under the GPL license.
+
+END_OF_VERSION
+};
+
+sub usage
+{
+  &version;
+
+  print <<END_OF_HEADER;
+Usage: $0 [options]
+
+The following options are recognized:
+
+END_OF_HEADER
+
+  foreach my $group ("", "dbi", "basic", "plugin")
+  {
+    foreach my $option (sort keys %{$usage_information->{$group}})
+    {
+      my $usage = join " ", @{$usage_information->{$group}->{$option}->{'ARGUMENTS'}};
+      printf("  --%s%s", $option, $usage ne ''?" ".$usage:"");
+      foreach my $alias (@{$usage_information->{$group}->{$option}->{'ALIASES'}})
+      {
+        printf(", %s %s", $alias, $usage);
+      }
+      printf("\n");
+      printf("    %s\n", join "\n    ", @{$usage_information->{$group}->{$option}->{'MESSAGE'}});
+    }
+    printf "\n";
+  }
+
+  return 0;
+}
+
+#
+# Load all plugins.
+#
+# This iterates over all plugin_* options and attempts to load the plugin
+# and initialize it.  If any plugin fails to load, we exit.
+#
+sub load_plugins()
+{
+  my %plugin_options = $config->varlist("^plugin_");
+  my %plugin_initialize_priority = ();
+
+  printf "Loading plugins...\n";
+  foreach my $plugin_option (keys %plugin_options)
+  {
+    my $plugin_name = $plugin_option;
+    my $plugin_package = $plugin_options{$plugin_option};
+    $plugin_name =~ s/^plugin_//;
+
+    if(eval sprintf("require %s;", $plugin_package))
+    {
+      $plugin->{$plugin_name} = $plugin_package->new($config, $plugin);
+
+      my @missing_config_keys = $plugin->{$plugin_name}->load_config();
+
+      if(@missing_config_keys)
+      {
+        printf("ERROR: You must specify config_plugin values for (%s) for plugin %s!\n",
+          join(", ", @missing_config_keys), $plugin_package);
+        exit;
+      }
+
+      my $priority = $plugin->{$plugin_name}->initialize_priority();
+      if(!exists($plugin_initialize_priority{$priority}))
+      {
+        $plugin_initialize_priority{$priority} = [];
+      }
+      
+      push @{$plugin_initialize_priority{$priority}}, $plugin_name;
+    }
+    else
+    {
+      printf "ERROR: Couldn't load plugin %s: %s", $plugin_package, $@;
+      exit;
+    }
+  }
+
+  printf "Initializing plugins...\n";
+  foreach my $priority (sort { $a <=> $b } keys %plugin_initialize_priority)
+  {
+    foreach my $plugin_name (@{$plugin_initialize_priority{$priority}})
+    {
+      my $plugin_package = $plugin_options{"plugin_".$plugin_name};
+      my $plugin_status = $plugin->{$plugin_name}->initialize();
+
+      printf "  %-15s%-45s%-6.2f%8s\n",
+        $plugin_name, $plugin_package, $plugin_package->VERSION,
+        (defined($plugin_status) and exists($EasyPXE::Plugin::PLUGIN_STATUS{$plugin_status}))?
+          $EasyPXE::Plugin::PLUGIN_STATUS{$plugin_status}:
+          "INVALID";
+
+      if(!defined($plugin_status) or $plugin_status != $EasyPXE::Plugin::PLUGIN_STATUS_OK)
+      {
+        printf "ERROR: Plugin %s failed to initialize!\n", $plugin_package;
+        exit;
+      }
+    }
+  }
+  
+  print "\n";
+}
+
+#
+# Shut down all plugins and then exit.  This is of course only called on clean
+# shutdown.  If the system dies, you're out of luck.
+#
+sub shutdown($)
+{
+  my ($event) = @_;
+
+  foreach my $plugin_name (keys %{$plugin})
+  {
+    $plugin->{$plugin_name}->shutdown();
+  }
+
+  exit;
+}
+
+#
+# Main server loop.
+#
+sub main()
+{
+  &read_config;
+
+  if($config->get("help"))    { &usage;   exit; }
+  if($config->get("version")) { &version; exit; }
+
+  &version;
+
+  &load_plugins;
+
+  signal_new(SIGINT,  \&shutdown)->add;
+  signal_new(SIGHUP,  \&shutdown)->add;
+  signal_new(SIGQUIT, \&shutdown)->add;
+
+  print "Ready to respond...\n\n";
+
+  &event_mainloop
+    or die "Failed to start event loop: $!";
+}
+
+&main;
