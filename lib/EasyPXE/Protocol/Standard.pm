@@ -228,7 +228,7 @@ sub handle_dhcp_discover($$)
 
   $self->plugin->{'lease'}->record_lease($offer->{ip}, $mac_address, "OFFER", $offer);
 
-  $self->plugin->{'network'}->send_dhcp_packet($dhcp_reply, $dhcp_client)
+  $self->plugin->{'network_dhcp'}->send_dhcp_packet($dhcp_reply, $dhcp_client)
     or die "Error sending DHCPOFFER in response to DHCPDISCOVER: $!";
 
   $self->plugin->{'session'}->track_session($dhcp_packet, "SELECTING", $offer->{ip});
@@ -306,7 +306,7 @@ sub handle_dhcp_request($$)
 
     if(defined($dhcp_reply))
     {
-      $self->plugin->{'network'}->send_dhcp_packet($dhcp_reply, $dhcp_client)
+      $self->plugin->{'network_dhcp'}->send_dhcp_packet($dhcp_reply, $dhcp_client)
         or die "Error sending DHCPACK in response to DHCPREQUEST: $!";
   
       $self->plugin->{'lease'}->record_lease($offer->{ip}, $mac_address, "PERMANENT", $offer);
@@ -321,7 +321,7 @@ sub handle_dhcp_request($$)
   my ($dhcp_reply, $dhcp_client) =
     $self->construct_dhcp_reply($dhcp_packet, DHCPNAK(), undef);
 
-  $self->plugin->{'network'}->send_dhcp_packet($dhcp_reply, $dhcp_client)
+  $self->plugin->{'network_dhcp'}->send_dhcp_packet($dhcp_reply, $dhcp_client)
     or die "Error sending DHCPNAK in response to DHCPREQUEST: $!";
 }
 
