@@ -182,7 +182,7 @@ Net::TFTP::Packet - Object methods to create a TFTP packet.
 
 =head1 SYNOPSIS
 
-   use Net::DHCP::Packet;
+   use Net::TFTP::Packet;
 
    my $p = new Net::TFTP::Packet(
      Op      => TFTP_DATA(),
@@ -252,7 +252,7 @@ See below methods for values and syntax description.
 
 =item op( [BYTE] )
 
-Sets/gets the I<DHCP opcode>.
+Sets/gets the I<TFTP opcode>.
 
 Normal values are:
 
