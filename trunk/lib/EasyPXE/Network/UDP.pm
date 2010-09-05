@@ -148,7 +148,7 @@ sub event_read_and_dispatch_dhcp_request($)
   eval
   {
     my $dhcp_packet = $self->recv_dhcp_packet();
-    $self->plugin->{'protocol'}->dispatch_dhcp_packet($dhcp_packet);
+    $self->plugin->{'protocol_dhcp'}->dispatch_dhcp_packet($dhcp_packet);
   };
   print STDERR "Got error inside eval: " . $@ if $@;
 }

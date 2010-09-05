@@ -144,8 +144,10 @@ my $config_options = {
 
   "config_plugin=s@"              => { DEFAULT => [] },
 
-  "plugin_network=s"              => { DEFAULT => "EasyPXE::Network::UDP" },
-  "plugin_protocol=s"             => { DEFAULT => "EasyPXE::Protocol::Standard" },
+  "plugin_network_dhcp=s"         => { DEFAULT => "EasyPXE::Network::UDP" },
+  "plugin_network_tftp=s"         => { DEFAULT => "EasyPXE::Network::TFTP" },
+  "plugin_protocol_dhcp=s"        => { DEFAULT => "EasyPXE::Protocol::Standard" },
+  "plugin_protocol_tftp=s"        => { DEFAULT => "EasyPXE::Protocol::TFTP" },
   "plugin_dbi=s"                  => { DEFAULT => "EasyPXE::DBI::MySQL" },
   "plugin_session=s"              => { DEFAULT => "EasyPXE::Session::DBI" },
   "plugin_lease=s"                => { DEFAULT => "EasyPXE::Lease::DBI" },
